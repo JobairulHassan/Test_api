@@ -1,909 +1,4 @@
-**Line 1219:** Wait for all children to complete
-- Blocks until all forked processes finish
-- Ensures all exports complete before continuing
-
----
-
-### Lines 1221-1228: Collect Export Results
-```perl
-        foreach my $key (keys %export_ret) {
-            my $arr = $export_ret{$key};
-            foreach my $pack (@{$arr}) {
-                push @packs, $pack;
-            }
-        }
-```
-
-**Purpose:** Merge results from all child processes
-
-**Data Flow:**
-1. Each child returns array of package data
-2. Stored in `%export_ret` by callback
-3. Now flatten all arrays into single `@packs` array
-
-**Result:** `@packs` contains all successfully exported packages
-
----
-
-### The prepare_git() Function (Detailed)
-
-```perl
-sub prepare_git {
-    my $config = shift;
-    my $base = shift;
-    my $specs = shift;
-    my $packaging_dir = shift;
-    my $upstream_branch = shift;
-    my $upstream_tag = shift;
-
-    my @packs_arr = ();
-    my @spec_list = split(",", $specs);
-```
-
-**Parameters:**
-- `$config`: Build configuration hash
-- `$base`: Git repository path
-- `$specs`: Comma-separated spec file paths
-- `$packaging_dir`: Where packaging files are
-- `$upstream_branch`/`$upstream_tag`: For tarball generation
-
-**Line 849:** Split comma-separated spec list into array
-
----
-
-### Lines 850-906: Process Each Spec File
-
-```perl
-    foreach my $spec (@spec_list) {
-        my $spec_file = basename($spec);
-
-        if ($includeall == 0 || $spec_commit ne "") {
-            my $tmp_dir = abs_path(tempdir(CLEANUP=>1));
-            my $tmp_spec = "$tmp_dir/$spec_file";
-            my $without_base;
-            $spec =~ s!\Q$base/\E!!;
-            $without_base = $spec;
-            if (my_system("cd '$base'; git show $spec_commit:$without_base >'$tmp_spec' 2>/dev/null") != 0) {
-                warning("failed to checkout spec file from commit: $spec_commit:$without_base");
-                return;
-            }
-            $spec = $tmp_spec;
-        }
-```
-
-**Line 851:** Get just filename from full path
-
-**Lines 853-865: Checkout spec from git if needed**
-- Create temporary directory (auto-cleanup)
-- Remove base path from spec path
-- Use `git show` to extract spec from specific commit
-- If fails, return empty (package skipped)
-- Update `$spec` to point to temp file
-
-**Purpose:** 
-- Normal mode: Get spec from git commit
-- --include-all mode: Use spec from filesystem
-
----
-
-### Lines 868-874: Parse Spec File
-```perl
-        my $pack = Build::Rpm::parse($config, $spec);
-        if (! exists $pack->{name} || ! exists $pack->{version} || ! exists $pack->{release}) {
-            debug("failed to parse spec file: $spec, name,version,release fields must be present");
-            return;
-        }
-        my $pkg_name = $pack->{name};
-        my $pkg_version = $pack->{version};
-        my $pkg_release = $pack->{release};
-```
-
-**Line 868:** Parse spec file
-- Returns hash with name, version, release, deps, etc.
-- Uses RPM macro expansion
-
-**Lines 869-871:** Validation
-- Spec must have Name, Version, Release fields
-- If missing, skip this package
-
-**Lines 872-874:** Extract key fields
-- Will be used to construct cache key
-
----
-
-### Lines 875-895: Check Export Cache
-```perl
-        my $cache_key = "$pkg_name-$pkg_version-$pkg_release";
-        my $cached_rev = read_cache($cache_key);
-        my $skip = 0;
-        my $current_rev = '';
-
-        if (! -e "$base/.git") {
-            warning("not a git repo: $base/.git!!");
-            return;
-        } else {
-            $current_rev = query_git_commit_rev($base, $commit);
-            $skip = ($cached_rev eq $current_rev) && (-e "$pkg_path/$cache_key/$spec_file");
-            $source_cache{"$base:$cached_rev"} = "$pkg_path/$cache_key" if ($skip);
-        }
-```
-
-**Line 875:** Create cache key
-- Format: `package-1.0-1`
-- Used for cache files and export directory
-
-**Line 876:** Read cache
-- Check if we've exported this before
-- Cache file contains git commit ID
-
-**Lines 880-889: Determine if can skip export**
-- Verify `.git` directory exists
-- Get current commit ID
-- Skip if: cached commit matches current commit AND export directory exists
-- If skipping, store path in `$source_cache`
-
-**Cache File Location:** `~/GBS-ROOT/local/sources/tizen/cache/package-1.0-1`
-
-**Cache File Content:** Git commit ID (e.g., `abc123def456...`)
-
----
-
-### Lines 898-917: Perform Export or Use Cache
-```perl
-        if (!$skip || $includeall == 1) {
-            my $val = ($includeall == 1) ? "include-all" : $current_rev;
-            info("start export source from: $base ...");
-            
-            if ($includeall != 1 && exists $source_cache{"$base:$current_rev"}) {
-                my $exported_key = basename($source_cache{"$base:$current_rev"});
-                my_system("cp -r '$pkg_path'/'$exported_key'  '$pkg_path'/'$cache_key'");
-                my_system("cp -f '$pkg_path'/cache/'$exported_key' '$pkg_path'/cache/'$cache_key'");
-
-                my $src_rpm = "$srpm_repo_path/$cache_key.src.rpm";
-                if (-f "$src_rpm") {
-                    my_system("rm -f '$src_rpm'");
-                }
-            } else {
-                unless (write_cache($cache_key, $val, $base, $spec_file, $packaging_dir, $upstream_branch, $upstream_tag)) {
-                    clean_cache($cache_key);
-                    debug("$pkg_name was not exported correctly");
-                    return;
-                }
-            }
-            $source_cache{"$base:$current_rev"} = "$pkg_path/$cache_key";
-        }
-```
-
-**Scenario 1: Can skip export**
-- Do nothing, use cached export
-
-**Scenario 2: Include-all mode**
-- Always export (may have uncommitted changes)
-
-**Scenario 3: Already exported from same commit (multi-spec)**
-- Copy previous export to new cache key
-- Example: `package.spec` and `package-extra.spec` from same repo
-- Copy `package-1.0-1/` to `package-extra-1.0-1/`
-
-**Scenario 4: Need fresh export**
-- Call `write_cache()` to actually export
-- If export fails, clean up and skip package
-
-**Line 917:** Store export path for future multi-spec packages
-
----
-
-### Lines 920-934: Verify Export and Add to Pack List
-```perl
-        if ( -e "$pkg_path/$cache_key/$spec_file" ){
-            my $pack;
-            $pack->{'filename'} = "$pkg_path/$cache_key/$spec_file";
-            $pack->{'project_base_path'} = $base;
-            push @packs_arr, $pack;
-        }else{
-            warning("spec file $spec_file has not been exported to $pkg_path/$cache_key/ correctly,".
-                    " please check if there're special macros in Name/Version/Release fields");
-        }
-    }
-
-    return @packs_arr;
-}
-```
-
-**Lines 920-926:** Verify export succeeded
-- Check if spec file exists in export directory
-- Create package data structure
-- Add to return array
-
-**Lines 927-929:** Export verification failed
-- Spec file missing (export failed silently)
-- Common cause: RPM macros in Name/Version/Release that can't be expanded
-
-**Line 933:** Return array of exported packages
-- Will be collected by Parallel::ForkManager
-
----
-
-### The write_cache() Function
-
-```perl
-sub write_cache {
-    my ($cache_key, $cache_val, $base, $spec, $packaging_dir, $upstream_branch, $upstream_tag) = @_;
-    my $cache_fname = "$cache_path/$cache_key";
-    my @export_out;
-    my $out_dir = "$pkg_path/$cache_key";
-
-    @export_out = gbs_export($base, $spec, $packaging_dir, $upstream_branch, $upstream_tag, $out_dir);
-    if (shift @export_out) {
-        push(@export_errors, {package_name => $cache_key,
-                              package_path => $base,
-                              error_info   => \@export_out});
-        return;
-    }
-
-    my $src_rpm = "$srpm_repo_path/$cache_key.src.rpm";
-    if (-f "$src_rpm") {
-        my_system("rm -f '$src_rpm'");
-    }
-
-    open(my $rev1, "+>", "$cache_fname") ||
-        die "write reversion cache($cache_fname) failed: $!";
-    print $rev1 $cache_val . "\n";
-    close($rev1);
-    1;
-}
-```
-
-**Lines 672-677:** Setup
-- `$cache_fname`: Where to store commit ID
-- `$out_dir`: Where to export source
-
-**Line 679:** Call gbs_export()
-- Returns array: (exit_code, @output_lines)
-- Exit code 0 = success
-
-**Lines 680-684:** Handle export failure
-- Add to `@export_errors` for reporting
-- Return without value (undefined = failure)
-
-**Lines 686-689:** Remove old SRPM if exists
-- Forces rebuild even if SRPM exists
-- Ensures fresh build with new source
-
-**Lines 691-694:** Write cache file
-- Store commit ID in cache file
-- Used for next build to skip export
-
-**Line 695:** Return success (true value)
-
----
-
-### The gbs_export() Function
-
-```perl
-sub gbs_export {
-    my ($base, $spec, $packaging_dir, $upstream_branch, $upstream_tag, $out_dir) = @_;
-    my @args = ();
-    my $cmd;
-    push @args, "gbs";
-    push @args, "--debug" if ($debug);
-    push @args, "export";
-    push @args, "'$base'";
-    push @args, "-o '$out_dir'";
-    push @args, "--outdir-directly";
-    push @args, "--spec $spec";
-    if ($includeall == 1) {
-        push @args, "--include-all";
-    } else {
-        push @args, "--commit=$commit";
-    }
-    if (! $upstream_branch eq "") {
-        push @args, "--upstream-branch='$upstream_branch'";
-    }
-    if (! $upstream_tag eq "") {
-        push @args, "--upstream-tag='$upstream_tag'";
-    }
-    if ($fallback_to_native == 1) {
-        push @args, "--fallback-to-native";
-    }
-    if (! $squash_patches_until eq "") {
-        push @args, "--squash-patches-until=$squash_patches_until";
-    }
-    if (! $packaging_dir eq "") {
-        push @args, "--packaging-dir=$packaging_dir";
-    }
-    if ($no_patch_export == 1) {
-        push @args, "--no-patch-export";
-    }
-    if ($thread_export == 1){
-        push @args, " 2>&1 | grep -v warning | grep -v Creating";
-    }
-    if ($with_submodules == 1) {
-       push @args, "--with-submodules";
-    }
-
-    $cmd = join(" ", @args);
-    return my_system($cmd);
-}
-```
-
-**Purpose:** Build and execute gbs export command
-
-**Command Structure:**
-```bash
-gbs export \
-  '/path/to/repo' \
-  -o '/path/to/output' \
-  --outdir-directly \
-  --spec mypackage.spec \
-  --commit=HEAD \
-  --packaging-dir=packaging
-```
-
-**Key Options:**
-- `--outdir-directly`: Don't create subdirectory for package
-- `--include-all`: Export uncommitted changes too
-- `--commit`: Specific commit to export
-- `--upstream-branch/tag`: For tarball generation
-- `--fallback-to-native`: If tarball fails, use native mode
-- `--squash-patches-until`: Combine patches into one
-- `--no-patch-export`: Don't generate patch files
-- `--with-submodules`: Include git submodules
-
-**What gbs export does:**
-1. Creates source tarball from upstream branch/tag
-2. Generates patch files for all commits since upstream
-3. Copies spec file and other packaging files
-4. Prepares directory structure for rpmbuild
-
-**Export Directory Structure:**
-```
-package-1.0-1/
-├── package.spec
-├── package-1.0.tar.gz         (upstream tarball)
-├── 0001-first-patch.patch
-├── 0002-second-patch.patch
-└── other-source-files
-```
-
----
-
-## Repository Metadata Retrieval
-
-This section handles scanning repositories to build dependency database.
-
-### Lines 1242-1246: Start Metadata Retrieval
-```perl
-info("retrieving repo metadata...");
-my $repos_setup = 1;
-my_system("> '$order_dir'/.repo.cache.local");
-```
-
-**Line 1243:** Success flag (will be set to 0 if any repo fails)
-
-**Line 1244:** Create empty local cache file
-- `>` operator truncates file to zero length
-- Ensures clean start
-
----
-
-### Lines 1247-1251: Scan Local Repository
-```perl
-if (-d "$rpm_repo_path") {
-    my_system("$build_dir/createdirdeps '$rpm_repo_path' >> '$order_dir'/.repo.cache.local");
-    my_system("echo D: >> '$order_dir'/.repo.cache.local");
-}
-```
-
-**Purpose:** Extract metadata from local RPM repository
-
-**createdirdeps:** OBS script that reads RPM headers
-- Input: Directory containing RPM files
-- Output: Dependency information in repo cache format
-
-**Format (appended to .repo.cache.local):**
-```
-F:package.arch-buildtime/installtime/0: /path/to/package.rpm
-P:package.arch-buildtime/installtime/0: package = 1.0 package(arch) = 1.0
-R:package.arch-buildtime/installtime/0: libc.so.6 libssl.so
-I:package.arch-buildtime/installtime/0: package-1.0-1 buildtime
-D:
-```
-
-**Line 1249:** Add delimiter `D:` to separate local from remote repos
-
----
-
-### Lines 1252-1268: Scan Remote Repositories
-```perl
-my_system("> '$order_dir'/.repo.cache.remote");
-foreach my $repo (@package_repos) {
-    my $cmd = "";
-    if ($repo =~ /^\// && ! -e "$repo/repodata/repomd.xml") {
-        $cmd = "$build_dir/createdirdeps '$repo' >> '$order_dir'/.repo.cache.remote ";
-    } else {
-        $cmd = "$build_dir/createrepomddeps --cachedir='$cache_dir' '$repo' >> '$order_dir'/.repo.cache.remote ";
-    }
-    debug($cmd);
-    if ( my_system($cmd) == 0 ) {
-        my_system("echo D: >> '$order_dir'/.repo.cache.remote");
-    } else {
-        $repos_setup = 0;
-    }
-}
-```
-
-**Line 1252:** Create empty remote cache file
-
-**Lines 1253-1267: Process each repository**
-
-**Decision Logic:**
-1. If path starts with `/` AND no repodata: Local directory, use `createdirdeps`
-2. Otherwise: Remote repo or local with repodata, use `createrepomddeps`
-
-**createdirdeps:** 
-- Reads RPM headers directly from files
-- Used for directories without repo metadata
-- Slower but works with plain RPM directories
-
-**createrepomddeps:**
-- Downloads and parses repository metadata (XML files)
-- Caches downloaded metadata in `$cache_dir`
-- Much faster for remote repos
-- Used for: HTTP URLs, local repos with repodata
-
-**Lines 1261-1266:** Execute and check result
-- Append delimiter after each successful repo
-- Set `$repos_setup = 0` if any fails
-
----
-
-### Lines 1269-1270: Merge Cache Files
-```perl
-my_system("cat '$order_dir'/.repo.cache.local '$order_dir'/.repo.cache.remote >'$order_dir'/.repo.cache");
-```
-
-**Purpose:** Combine local and remote metadata
-
-**Order Matters:**
-- Local packages listed first
-- Takes precedence in dependency resolution
-- Freshly built packages used before remote ones
-
-**Result:** Single `.repo.cache` file with all package metadata
-
----
-
-### Lines 1272-1274: Check Setup Success
-```perl
-if ($repos_setup == 0 ) {
-    error("repo cache creation failed...");
-}
-```
-
-**Fatal Error:** Can't proceed without repository metadata
-
----
-
-## Package Parsing
-
-### Lines 1276-1278: Parse All Packages
-```perl
-info("parsing package data...");
-my %packs = parse_packs($config, @packs);
-%to_build = %packs;
-```
-
-**Input:** `@packs` array from source export
-**Output:** `%to_build` hash with package metadata
-
----
-
-### The parse_packs() Function
-
-```perl
-sub parse_packs {
-    my ($config, @packs) = @_;
-    my %packs = ();
-    my %tmp_sub_to_main = ();
-```
-
-**Purpose:** Parse all spec files and extract metadata
-
-**Line 1014:** `%packs`: Return value (all parsed packages)
-**Line 1015:** `%tmp_sub_to_main`: Map sub-packages to main package
-
----
-
-### Lines 1017-1026: Process Each Package
-```perl
-    foreach my $spec_ref (@packs) {
-        my $spec;
-        my $base;
-        if (ref($spec_ref) eq "HASH") {
-            $spec = $spec_ref->{filename};
-            $base = $spec_ref->{project_base_path};
-        } else {
-            $spec = $spec_ref;
-        }
-```
-
-**Flexibility:** Handles both hash refs and plain strings
-- Git style: Hash with filename and base path
-- OBS style: Just spec file path
-
----
-
-### Lines 1027-1036: Parse Spec and Check Architecture
-```perl
-        my $pack = Build::Rpm::parse($config, $spec);
-        
-        if ( ( $pack->{'exclarch'} ) &&  ( ! grep $_ eq $archs[0], @{$pack->{'exclarch'}} ) ) {
-            warning($pack->{name} . ": build arch not compatible: " . join(" ", @{$pack->{'exclarch'}}));
-            next;
-        }
-        if ( ( $pack->{'badarch'} ) &&  ( grep $_ eq $archs[0], @{$pack->{'badarch'}} ) ) {
-            warning($pack->{name} . ": build arch not compatible: " . join(" ", @{$pack->{'badarch'}}));
-            next;
-        }
-```
-
-**Line 1027:** Parse spec file
-- Expands RPM macros
-- Extracts: name, version, release, dependencies, sub-packages
-
-**Lines 1029-1032:** Check ExclusiveArch
-- Spec can specify which architectures are supported
-- Example: `ExclusiveArch: x86_64 aarch64`
-- Skip if our architecture not in list
-
-**Lines 1033-1036:** Check ExcludeArch  
-- Opposite of ExclusiveArch
-- Example: `ExcludeArch: i586`
-- Skip if our architecture in exclude list
-
----
-
-### Lines 1037-1042: Extract Package Info
-```perl
-        my $name = $pack->{name};
-        my $version = $pack->{version};
-        my $release = $pack->{release};
-        my @buildrequires = $pack->{deps};
-        my @subpacks = $pack->{subpacks};
-        my @sources = ();
-```
-
-**Build Dependencies:** `@buildrequires`
-- Packages needed to build this package
-- Example: `['gcc', 'make', 'autoconf', 'libtool']`
-
-**Sub-packages:** `@subpacks`
-- Binary packages produced by this spec
-- Example: Main package `mylib` produces:
-  - `mylib` (runtime library)
-  - `mylib-devel` (headers)
-  - `mylib-docs` (documentation)
-
----
-
-### Lines 1043-1055: Find Source Tarballs
-```perl
-        for my $src (keys %{$pack}) {
-            next if $src !~ /source/;
-            next if (is_archive_filename($pack->{$src}) == 0);
-            push @sources, $src;
-        }
-        
-        my @sorted =  sort {
-            my $l = ($a =~ /source(\d*)/)[0];
-            $l = -1 if ($l eq "");
-            my $r = ($b =~ /source(\d*)/)[0];
-            $r = -1 if ($r eq "");
-            int($l) <=> int($r);
-        } @sources;
-```
-
-**Lines 1043-1047:** Find all source tags
-- Spec can have: `Source0`, `Source1`, `Source2`, etc.
-- Filter for archive files only (`.tar.gz`, `.zip`, etc.)
-
-**Lines 1049-1055:** Sort by number
-- Extract number from `Source<N>`
-- Sort numerically
-- `Source0` comes first, then `Source1`, etc.
-
----
-
-### Lines 1057-1060: Check Exclude List
-```perl
-        if ( (grep $_ eq $name, @exclude) ) {
-            next;
-        }
-```
-
-**Skip:** If package name in exclude list
-
----
-
-### Lines 1061-1068: Store Package Metadata
-```perl
-        $packs{$name} = {
-            name => $name,
-            version => $version,
-            release => $release,
-            deps => @buildrequires,
-            subpacks => @subpacks,
-            filename => $spec,
-        };
-```
-
-**Hash Structure:**
-- Key: Package name
-- Value: Hash ref with all metadata
-- Used throughout build process
-
----
-
-### Lines 1071-1073: Map Sub-packages
-```perl
-        foreach my $sub_p (@{$packs{$name}->{subpacks}}) {
-            $tmp_sub_to_main{$sub_p} = $name;
-        }
-        %subptomainp = %tmp_sub_to_main;
-```
-
-**Purpose:** Map binary package names to source package
-
-**Example:**
-```perl
-%subptomainp = (
-    'mylib' => 'mylib',
-    'mylib-devel' => 'mylib',
-    'mylib-docs' => 'mylib'
-);
-```
-
-**Used in:** Dependency resolution
-- Dependency on `mylib-devel` means dependency on source package `mylib`
-
----
-
-### Lines 1075-1080: Store Main Source File
-```perl
-        if (@sorted) {
-            $packs{$name}->{source} = basename($pack->{shift @sorted});
-        }
-
-        if ($base) {
-            $packs{$name}{project_base_path} = $base;
-        }
-```
-
-**Line 1076:** Store primary source tarball name
-- Takes first (lowest numbered) source
-- Only stores basename, not full path
-
-**Lines 1079-1081:** Store git repository path
-- Only set for git-style packages
-- Used for incremental builds
-
----
-
-### Lines 1085-1114: Append Missing Sub-packages from Repo
-```perl
-    if ($work_done == 1) {
-        my @check_repos = ("$localrepo/$dist/$arch/");
-        my %recal_deps = ();
-        %recal_deps = recalculate_repomddeps(@check_repos);
-
-        foreach my $miss_pack (keys %recal_deps) {
-            if (grep $_ eq $miss_pack, (keys %packs)) {
-                my $pushed = 0;
-                my @packs_subpackages = @{$packs{$miss_pack}->{'subpacks'}};
-                my @recal_rpms = @{$recal_deps{$miss_pack}};
-
-                foreach my $miss_p (@recal_rpms) {
-                  if (!(grep $_ eq $miss_p, (@packs_subpackages))) {
-                    push(@packs_subpackages, $miss_p);
-                    $pushed = 1;
-                  }
-                }
-
-                if ($pushed == 1) {
-                    @{$packs{$miss_pack}->{subpacks}} = @packs_subpackages;
-                    foreach my $sub_p (@{$packs{$miss_pack}->{subpacks}}) {
-                        $tmp_sub_to_main{$sub_p} = $miss_pack;
-                    }
-                    %subptomainp = %tmp_sub_to_main;
-                }
-            }
-        }
-    }
-
-    return %packs;
-}
-```
-
-**Purpose:** Handle packages that generate different sub-packages than spec declares
-
-**When:** Only after first build completes (`$work_done == 1`)
-
-**Problem:** 
-- Spec may conditionally create sub-packages
-- Example: `-devel` package only if certain macros defined
-- Need actual built RPMs to know what was produced
-
-**Solution:**
-- Read actual RPMs from local repo
-- Add any missing sub-packages
-- Update mapping
-
-**Result:** Accurate sub-package list for next iteration
-
----
-
-## Repository Metadata Parsing
-
-### The refresh_repo() Function
-
-```perl
-sub refresh_repo {
-    my $rpmdeps = "$order_dir/.repo.cache";
-    my (%fn, %prov, %req, %rec);
-    my %exportfilters = %{$config->{'exportfilter'}};
-    my %packs;
-    my %ids;
-
-    my %packs_arch;
-    my %packs_done;
-    open(my $fh, '<', "$rpmdeps") || die("$rpmdeps: $!\n");
-```
-
-**Purpose:** Parse `.repo.cache` and build `%repo` hash
-
-**Variables:**
-- `%fn`: Filename for each package
-- `%prov`: Provides list
-- `%req`: Requires list  
-- `%rec`: Recommends list
-- `%ids`: Package IDs (for version comparison)
-- `%packs`: Final package selection per architecture
-
----
-
-### Lines 1396-1459: Parse Cache File
-```perl
-    my ($pkgF, $pkgP, $pkgR, $pkgr);
-    while(<$fh>) {
-      chomp;
-      if (/^F:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
-        my $pkgname = basename($2);
-        $pkgF = $2;
-        next if $fn{$1};
-        $fn{$1} = $2;
-        my $pack = $1;
-        $pack =~ /^(.*)\.([^\.]+)$/ or die;
-        push @{$packs_arch{$2}}, $1;
-        my $basename = $1;
-        my $arch = $2;
-        for(keys %exportfilters) {
-            next if ($pkgname !~ /$_/);
-            for (@{$exportfilters{$_}}) {
-                my $target_arch = $_;
-                next if ($target_arch eq ".");
-                next if (! grep ($_ eq $target_arch, @archs));
-                $packs{$basename} = "$basename.$arch"
-            }
-        }
-      } elsif (/^P:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
-        $pkgP = $2;
-        next if $prov{$1};
-        $prov{$1} = $2;
-      } elsif (/^R:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
-        $pkgR = $2;
-        next if $req{$1};
-        $req{$1} = $2;
-      } elsif (/^r:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
-        $pkgr = $2;
-        next if $rec{$1};
-        $rec{$1} = $2;
-      } elsif (/^I:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
-        my $r = 0;
-        if ($use_higher_deps == 1) {
-          $r = 1;
-        } else {
-          if ($packs_done{$1}) {
-            $r = 0;
-          } else {
-            $r = 1;
-          }
-        }
-
-        if ($ids{$1} && ($r == 1) && defined($pkgF) && defined($pkgP) && defined($pkgR)) {
-          my $i = $1;
-          my $oldid = $ids{$1};
-          my $newid = $2;
-          if (Build::Rpm::verscmp($oldid, $newid) < 0) {
-            $ids{$i}  = $newid;
-            $fn{$i}   = $pkgF;
-            $prov{$i} = $pkgP;
-            $req{$i}  = $pkgR;
-          }
-        } else {
-          next if $ids{$1};
-          $ids{$1} = $2;
-        }
-        undef $pkgF;
-        undef $pkgP;
-        undef $pkgR;
-      } elsif ($_ eq 'D:') {
-        %packs_done = %ids;
-      }
-    }
-    close $fh;
-```
-
-**Cache File Format:**
-```
-F:package.arch-123/456/0: /path/package.rpm
-P:package.arch-123/456/0: package = 1.0 provides-this
-R:package.arch-123/456/0: requires-that >= 2.0
-r:package.arch-123/456/0: recommends-another
-I:package.arch-123/456/0: package-1.0-1 123456789
-D:
-```
-
-**Line-by-Line Parsing:**
-
-**F: Filename**
-- Extract package name and architecture
-- Store filename
-- Group packages by architecture
-- Handle export filters (specific arch preferences)
-
-**P: Provides**
-- What this package provides
-- Used in dependency resolution
-
-**R: Requires**
-- What this package requires
-- Hard dependencies
-
-**r: Recommends**
-- Soft dependencies
-- Not mandatory but suggested
-
-**I: Package ID**
-- Version and build time information
-- Handle duplicate packages (keep newer version)
-- `Build::Rpm::verscmp()`: RPM version comparison
-- `$use_higher_deps`: Prefer higher versions across repos
-
-**D: Delimiter**
-- Marks repository boundary
-- After D:, packages can't override earlier ones (unless use_higher_deps)
-
----
-
-### Lines 1461-1464: Select Architecture-Specific Packages
-```perl
-    for my $arch (@archs) {
-      $packs{$_} ||= "$_.$arch" for @{$packs_arch{$arch} || []};
-    }
-```
-
-**Purpose:** Choose best architecture for each package
-
-**Logic:**
-- Iterate through compatible architectures (x86_64, i686, i586, ...)
-- If package not yet selected, use this architecture's version
-- First match wins (prefer more specific architecture)
-
-**Example for x86_64 build:**
-```perl
-# Package foo available in: x86_64, i586, noarch
-# @archs = ('x86_64', 'i686',# GBS Build Tool (Depanneur) - Complete Line-by-Line Documentation
+# GBS Build Tool (Depanneur) - Complete Line-by-Line Documentation
 
 ## Table of Contents
 1. [Introduction](#introduction)
@@ -2660,3 +1755,904 @@ This is one of the most complex sections. Let me break it down:
 - `$pm->finish(status, data)`: Exit child, return data to parent
 - Status 0 = success
 - Data passed to `run_on_
+**Line 1219:** Wait for all children to complete
+- Blocks until all forked processes finish
+- Ensures all exports complete before continuing
+
+---
+
+### Lines 1221-1228: Collect Export Results
+```perl
+        foreach my $key (keys %export_ret) {
+            my $arr = $export_ret{$key};
+            foreach my $pack (@{$arr}) {
+                push @packs, $pack;
+            }
+        }
+```
+
+**Purpose:** Merge results from all child processes
+
+**Data Flow:**
+1. Each child returns array of package data
+2. Stored in `%export_ret` by callback
+3. Now flatten all arrays into single `@packs` array
+
+**Result:** `@packs` contains all successfully exported packages
+
+---
+
+### The prepare_git() Function (Detailed)
+
+```perl
+sub prepare_git {
+    my $config = shift;
+    my $base = shift;
+    my $specs = shift;
+    my $packaging_dir = shift;
+    my $upstream_branch = shift;
+    my $upstream_tag = shift;
+
+    my @packs_arr = ();
+    my @spec_list = split(",", $specs);
+```
+
+**Parameters:**
+- `$config`: Build configuration hash
+- `$base`: Git repository path
+- `$specs`: Comma-separated spec file paths
+- `$packaging_dir`: Where packaging files are
+- `$upstream_branch`/`$upstream_tag`: For tarball generation
+
+**Line 849:** Split comma-separated spec list into array
+
+---
+
+### Lines 850-906: Process Each Spec File
+
+```perl
+    foreach my $spec (@spec_list) {
+        my $spec_file = basename($spec);
+
+        if ($includeall == 0 || $spec_commit ne "") {
+            my $tmp_dir = abs_path(tempdir(CLEANUP=>1));
+            my $tmp_spec = "$tmp_dir/$spec_file";
+            my $without_base;
+            $spec =~ s!\Q$base/\E!!;
+            $without_base = $spec;
+            if (my_system("cd '$base'; git show $spec_commit:$without_base >'$tmp_spec' 2>/dev/null") != 0) {
+                warning("failed to checkout spec file from commit: $spec_commit:$without_base");
+                return;
+            }
+            $spec = $tmp_spec;
+        }
+```
+
+**Line 851:** Get just filename from full path
+
+**Lines 853-865: Checkout spec from git if needed**
+- Create temporary directory (auto-cleanup)
+- Remove base path from spec path
+- Use `git show` to extract spec from specific commit
+- If fails, return empty (package skipped)
+- Update `$spec` to point to temp file
+
+**Purpose:** 
+- Normal mode: Get spec from git commit
+- --include-all mode: Use spec from filesystem
+
+---
+
+### Lines 868-874: Parse Spec File
+```perl
+        my $pack = Build::Rpm::parse($config, $spec);
+        if (! exists $pack->{name} || ! exists $pack->{version} || ! exists $pack->{release}) {
+            debug("failed to parse spec file: $spec, name,version,release fields must be present");
+            return;
+        }
+        my $pkg_name = $pack->{name};
+        my $pkg_version = $pack->{version};
+        my $pkg_release = $pack->{release};
+```
+
+**Line 868:** Parse spec file
+- Returns hash with name, version, release, deps, etc.
+- Uses RPM macro expansion
+
+**Lines 869-871:** Validation
+- Spec must have Name, Version, Release fields
+- If missing, skip this package
+
+**Lines 872-874:** Extract key fields
+- Will be used to construct cache key
+
+---
+
+### Lines 875-895: Check Export Cache
+```perl
+        my $cache_key = "$pkg_name-$pkg_version-$pkg_release";
+        my $cached_rev = read_cache($cache_key);
+        my $skip = 0;
+        my $current_rev = '';
+
+        if (! -e "$base/.git") {
+            warning("not a git repo: $base/.git!!");
+            return;
+        } else {
+            $current_rev = query_git_commit_rev($base, $commit);
+            $skip = ($cached_rev eq $current_rev) && (-e "$pkg_path/$cache_key/$spec_file");
+            $source_cache{"$base:$cached_rev"} = "$pkg_path/$cache_key" if ($skip);
+        }
+```
+
+**Line 875:** Create cache key
+- Format: `package-1.0-1`
+- Used for cache files and export directory
+
+**Line 876:** Read cache
+- Check if we've exported this before
+- Cache file contains git commit ID
+
+**Lines 880-889: Determine if can skip export**
+- Verify `.git` directory exists
+- Get current commit ID
+- Skip if: cached commit matches current commit AND export directory exists
+- If skipping, store path in `$source_cache`
+
+**Cache File Location:** `~/GBS-ROOT/local/sources/tizen/cache/package-1.0-1`
+
+**Cache File Content:** Git commit ID (e.g., `abc123def456...`)
+
+---
+
+### Lines 898-917: Perform Export or Use Cache
+```perl
+        if (!$skip || $includeall == 1) {
+            my $val = ($includeall == 1) ? "include-all" : $current_rev;
+            info("start export source from: $base ...");
+            
+            if ($includeall != 1 && exists $source_cache{"$base:$current_rev"}) {
+                my $exported_key = basename($source_cache{"$base:$current_rev"});
+                my_system("cp -r '$pkg_path'/'$exported_key'  '$pkg_path'/'$cache_key'");
+                my_system("cp -f '$pkg_path'/cache/'$exported_key' '$pkg_path'/cache/'$cache_key'");
+
+                my $src_rpm = "$srpm_repo_path/$cache_key.src.rpm";
+                if (-f "$src_rpm") {
+                    my_system("rm -f '$src_rpm'");
+                }
+            } else {
+                unless (write_cache($cache_key, $val, $base, $spec_file, $packaging_dir, $upstream_branch, $upstream_tag)) {
+                    clean_cache($cache_key);
+                    debug("$pkg_name was not exported correctly");
+                    return;
+                }
+            }
+            $source_cache{"$base:$current_rev"} = "$pkg_path/$cache_key";
+        }
+```
+
+**Scenario 1: Can skip export**
+- Do nothing, use cached export
+
+**Scenario 2: Include-all mode**
+- Always export (may have uncommitted changes)
+
+**Scenario 3: Already exported from same commit (multi-spec)**
+- Copy previous export to new cache key
+- Example: `package.spec` and `package-extra.spec` from same repo
+- Copy `package-1.0-1/` to `package-extra-1.0-1/`
+
+**Scenario 4: Need fresh export**
+- Call `write_cache()` to actually export
+- If export fails, clean up and skip package
+
+**Line 917:** Store export path for future multi-spec packages
+
+---
+
+### Lines 920-934: Verify Export and Add to Pack List
+```perl
+        if ( -e "$pkg_path/$cache_key/$spec_file" ){
+            my $pack;
+            $pack->{'filename'} = "$pkg_path/$cache_key/$spec_file";
+            $pack->{'project_base_path'} = $base;
+            push @packs_arr, $pack;
+        }else{
+            warning("spec file $spec_file has not been exported to $pkg_path/$cache_key/ correctly,".
+                    " please check if there're special macros in Name/Version/Release fields");
+        }
+    }
+
+    return @packs_arr;
+}
+```
+
+**Lines 920-926:** Verify export succeeded
+- Check if spec file exists in export directory
+- Create package data structure
+- Add to return array
+
+**Lines 927-929:** Export verification failed
+- Spec file missing (export failed silently)
+- Common cause: RPM macros in Name/Version/Release that can't be expanded
+
+**Line 933:** Return array of exported packages
+- Will be collected by Parallel::ForkManager
+
+---
+
+### The write_cache() Function
+
+```perl
+sub write_cache {
+    my ($cache_key, $cache_val, $base, $spec, $packaging_dir, $upstream_branch, $upstream_tag) = @_;
+    my $cache_fname = "$cache_path/$cache_key";
+    my @export_out;
+    my $out_dir = "$pkg_path/$cache_key";
+
+    @export_out = gbs_export($base, $spec, $packaging_dir, $upstream_branch, $upstream_tag, $out_dir);
+    if (shift @export_out) {
+        push(@export_errors, {package_name => $cache_key,
+                              package_path => $base,
+                              error_info   => \@export_out});
+        return;
+    }
+
+    my $src_rpm = "$srpm_repo_path/$cache_key.src.rpm";
+    if (-f "$src_rpm") {
+        my_system("rm -f '$src_rpm'");
+    }
+
+    open(my $rev1, "+>", "$cache_fname") ||
+        die "write reversion cache($cache_fname) failed: $!";
+    print $rev1 $cache_val . "\n";
+    close($rev1);
+    1;
+}
+```
+
+**Lines 672-677:** Setup
+- `$cache_fname`: Where to store commit ID
+- `$out_dir`: Where to export source
+
+**Line 679:** Call gbs_export()
+- Returns array: (exit_code, @output_lines)
+- Exit code 0 = success
+
+**Lines 680-684:** Handle export failure
+- Add to `@export_errors` for reporting
+- Return without value (undefined = failure)
+
+**Lines 686-689:** Remove old SRPM if exists
+- Forces rebuild even if SRPM exists
+- Ensures fresh build with new source
+
+**Lines 691-694:** Write cache file
+- Store commit ID in cache file
+- Used for next build to skip export
+
+**Line 695:** Return success (true value)
+
+---
+
+### The gbs_export() Function
+
+```perl
+sub gbs_export {
+    my ($base, $spec, $packaging_dir, $upstream_branch, $upstream_tag, $out_dir) = @_;
+    my @args = ();
+    my $cmd;
+    push @args, "gbs";
+    push @args, "--debug" if ($debug);
+    push @args, "export";
+    push @args, "'$base'";
+    push @args, "-o '$out_dir'";
+    push @args, "--outdir-directly";
+    push @args, "--spec $spec";
+    if ($includeall == 1) {
+        push @args, "--include-all";
+    } else {
+        push @args, "--commit=$commit";
+    }
+    if (! $upstream_branch eq "") {
+        push @args, "--upstream-branch='$upstream_branch'";
+    }
+    if (! $upstream_tag eq "") {
+        push @args, "--upstream-tag='$upstream_tag'";
+    }
+    if ($fallback_to_native == 1) {
+        push @args, "--fallback-to-native";
+    }
+    if (! $squash_patches_until eq "") {
+        push @args, "--squash-patches-until=$squash_patches_until";
+    }
+    if (! $packaging_dir eq "") {
+        push @args, "--packaging-dir=$packaging_dir";
+    }
+    if ($no_patch_export == 1) {
+        push @args, "--no-patch-export";
+    }
+    if ($thread_export == 1){
+        push @args, " 2>&1 | grep -v warning | grep -v Creating";
+    }
+    if ($with_submodules == 1) {
+       push @args, "--with-submodules";
+    }
+
+    $cmd = join(" ", @args);
+    return my_system($cmd);
+}
+```
+
+**Purpose:** Build and execute gbs export command
+
+**Command Structure:**
+```bash
+gbs export \
+  '/path/to/repo' \
+  -o '/path/to/output' \
+  --outdir-directly \
+  --spec mypackage.spec \
+  --commit=HEAD \
+  --packaging-dir=packaging
+```
+
+**Key Options:**
+- `--outdir-directly`: Don't create subdirectory for package
+- `--include-all`: Export uncommitted changes too
+- `--commit`: Specific commit to export
+- `--upstream-branch/tag`: For tarball generation
+- `--fallback-to-native`: If tarball fails, use native mode
+- `--squash-patches-until`: Combine patches into one
+- `--no-patch-export`: Don't generate patch files
+- `--with-submodules`: Include git submodules
+
+**What gbs export does:**
+1. Creates source tarball from upstream branch/tag
+2. Generates patch files for all commits since upstream
+3. Copies spec file and other packaging files
+4. Prepares directory structure for rpmbuild
+
+**Export Directory Structure:**
+```
+package-1.0-1/
+├── package.spec
+├── package-1.0.tar.gz         (upstream tarball)
+├── 0001-first-patch.patch
+├── 0002-second-patch.patch
+└── other-source-files
+```
+
+---
+
+## Repository Metadata Retrieval
+
+This section handles scanning repositories to build dependency database.
+
+### Lines 1242-1246: Start Metadata Retrieval
+```perl
+info("retrieving repo metadata...");
+my $repos_setup = 1;
+my_system("> '$order_dir'/.repo.cache.local");
+```
+
+**Line 1243:** Success flag (will be set to 0 if any repo fails)
+
+**Line 1244:** Create empty local cache file
+- `>` operator truncates file to zero length
+- Ensures clean start
+
+---
+
+### Lines 1247-1251: Scan Local Repository
+```perl
+if (-d "$rpm_repo_path") {
+    my_system("$build_dir/createdirdeps '$rpm_repo_path' >> '$order_dir'/.repo.cache.local");
+    my_system("echo D: >> '$order_dir'/.repo.cache.local");
+}
+```
+
+**Purpose:** Extract metadata from local RPM repository
+
+**createdirdeps:** OBS script that reads RPM headers
+- Input: Directory containing RPM files
+- Output: Dependency information in repo cache format
+
+**Format (appended to .repo.cache.local):**
+```
+F:package.arch-buildtime/installtime/0: /path/to/package.rpm
+P:package.arch-buildtime/installtime/0: package = 1.0 package(arch) = 1.0
+R:package.arch-buildtime/installtime/0: libc.so.6 libssl.so
+I:package.arch-buildtime/installtime/0: package-1.0-1 buildtime
+D:
+```
+
+**Line 1249:** Add delimiter `D:` to separate local from remote repos
+
+---
+
+### Lines 1252-1268: Scan Remote Repositories
+```perl
+my_system("> '$order_dir'/.repo.cache.remote");
+foreach my $repo (@package_repos) {
+    my $cmd = "";
+    if ($repo =~ /^\// && ! -e "$repo/repodata/repomd.xml") {
+        $cmd = "$build_dir/createdirdeps '$repo' >> '$order_dir'/.repo.cache.remote ";
+    } else {
+        $cmd = "$build_dir/createrepomddeps --cachedir='$cache_dir' '$repo' >> '$order_dir'/.repo.cache.remote ";
+    }
+    debug($cmd);
+    if ( my_system($cmd) == 0 ) {
+        my_system("echo D: >> '$order_dir'/.repo.cache.remote");
+    } else {
+        $repos_setup = 0;
+    }
+}
+```
+
+**Line 1252:** Create empty remote cache file
+
+**Lines 1253-1267: Process each repository**
+
+**Decision Logic:**
+1. If path starts with `/` AND no repodata: Local directory, use `createdirdeps`
+2. Otherwise: Remote repo or local with repodata, use `createrepomddeps`
+
+**createdirdeps:** 
+- Reads RPM headers directly from files
+- Used for directories without repo metadata
+- Slower but works with plain RPM directories
+
+**createrepomddeps:**
+- Downloads and parses repository metadata (XML files)
+- Caches downloaded metadata in `$cache_dir`
+- Much faster for remote repos
+- Used for: HTTP URLs, local repos with repodata
+
+**Lines 1261-1266:** Execute and check result
+- Append delimiter after each successful repo
+- Set `$repos_setup = 0` if any fails
+
+---
+
+### Lines 1269-1270: Merge Cache Files
+```perl
+my_system("cat '$order_dir'/.repo.cache.local '$order_dir'/.repo.cache.remote >'$order_dir'/.repo.cache");
+```
+
+**Purpose:** Combine local and remote metadata
+
+**Order Matters:**
+- Local packages listed first
+- Takes precedence in dependency resolution
+- Freshly built packages used before remote ones
+
+**Result:** Single `.repo.cache` file with all package metadata
+
+---
+
+### Lines 1272-1274: Check Setup Success
+```perl
+if ($repos_setup == 0 ) {
+    error("repo cache creation failed...");
+}
+```
+
+**Fatal Error:** Can't proceed without repository metadata
+
+---
+
+## Package Parsing
+
+### Lines 1276-1278: Parse All Packages
+```perl
+info("parsing package data...");
+my %packs = parse_packs($config, @packs);
+%to_build = %packs;
+```
+
+**Input:** `@packs` array from source export
+**Output:** `%to_build` hash with package metadata
+
+---
+
+### The parse_packs() Function
+
+```perl
+sub parse_packs {
+    my ($config, @packs) = @_;
+    my %packs = ();
+    my %tmp_sub_to_main = ();
+```
+
+**Purpose:** Parse all spec files and extract metadata
+
+**Line 1014:** `%packs`: Return value (all parsed packages)
+**Line 1015:** `%tmp_sub_to_main`: Map sub-packages to main package
+
+---
+
+### Lines 1017-1026: Process Each Package
+```perl
+    foreach my $spec_ref (@packs) {
+        my $spec;
+        my $base;
+        if (ref($spec_ref) eq "HASH") {
+            $spec = $spec_ref->{filename};
+            $base = $spec_ref->{project_base_path};
+        } else {
+            $spec = $spec_ref;
+        }
+```
+
+**Flexibility:** Handles both hash refs and plain strings
+- Git style: Hash with filename and base path
+- OBS style: Just spec file path
+
+---
+
+### Lines 1027-1036: Parse Spec and Check Architecture
+```perl
+        my $pack = Build::Rpm::parse($config, $spec);
+        
+        if ( ( $pack->{'exclarch'} ) &&  ( ! grep $_ eq $archs[0], @{$pack->{'exclarch'}} ) ) {
+            warning($pack->{name} . ": build arch not compatible: " . join(" ", @{$pack->{'exclarch'}}));
+            next;
+        }
+        if ( ( $pack->{'badarch'} ) &&  ( grep $_ eq $archs[0], @{$pack->{'badarch'}} ) ) {
+            warning($pack->{name} . ": build arch not compatible: " . join(" ", @{$pack->{'badarch'}}));
+            next;
+        }
+```
+
+**Line 1027:** Parse spec file
+- Expands RPM macros
+- Extracts: name, version, release, dependencies, sub-packages
+
+**Lines 1029-1032:** Check ExclusiveArch
+- Spec can specify which architectures are supported
+- Example: `ExclusiveArch: x86_64 aarch64`
+- Skip if our architecture not in list
+
+**Lines 1033-1036:** Check ExcludeArch  
+- Opposite of ExclusiveArch
+- Example: `ExcludeArch: i586`
+- Skip if our architecture in exclude list
+
+---
+
+### Lines 1037-1042: Extract Package Info
+```perl
+        my $name = $pack->{name};
+        my $version = $pack->{version};
+        my $release = $pack->{release};
+        my @buildrequires = $pack->{deps};
+        my @subpacks = $pack->{subpacks};
+        my @sources = ();
+```
+
+**Build Dependencies:** `@buildrequires`
+- Packages needed to build this package
+- Example: `['gcc', 'make', 'autoconf', 'libtool']`
+
+**Sub-packages:** `@subpacks`
+- Binary packages produced by this spec
+- Example: Main package `mylib` produces:
+  - `mylib` (runtime library)
+  - `mylib-devel` (headers)
+  - `mylib-docs` (documentation)
+
+---
+
+### Lines 1043-1055: Find Source Tarballs
+```perl
+        for my $src (keys %{$pack}) {
+            next if $src !~ /source/;
+            next if (is_archive_filename($pack->{$src}) == 0);
+            push @sources, $src;
+        }
+        
+        my @sorted =  sort {
+            my $l = ($a =~ /source(\d*)/)[0];
+            $l = -1 if ($l eq "");
+            my $r = ($b =~ /source(\d*)/)[0];
+            $r = -1 if ($r eq "");
+            int($l) <=> int($r);
+        } @sources;
+```
+
+**Lines 1043-1047:** Find all source tags
+- Spec can have: `Source0`, `Source1`, `Source2`, etc.
+- Filter for archive files only (`.tar.gz`, `.zip`, etc.)
+
+**Lines 1049-1055:** Sort by number
+- Extract number from `Source<N>`
+- Sort numerically
+- `Source0` comes first, then `Source1`, etc.
+
+---
+
+### Lines 1057-1060: Check Exclude List
+```perl
+        if ( (grep $_ eq $name, @exclude) ) {
+            next;
+        }
+```
+
+**Skip:** If package name in exclude list
+
+---
+
+### Lines 1061-1068: Store Package Metadata
+```perl
+        $packs{$name} = {
+            name => $name,
+            version => $version,
+            release => $release,
+            deps => @buildrequires,
+            subpacks => @subpacks,
+            filename => $spec,
+        };
+```
+
+**Hash Structure:**
+- Key: Package name
+- Value: Hash ref with all metadata
+- Used throughout build process
+
+---
+
+### Lines 1071-1073: Map Sub-packages
+```perl
+        foreach my $sub_p (@{$packs{$name}->{subpacks}}) {
+            $tmp_sub_to_main{$sub_p} = $name;
+        }
+        %subptomainp = %tmp_sub_to_main;
+```
+
+**Purpose:** Map binary package names to source package
+
+**Example:**
+```perl
+%subptomainp = (
+    'mylib' => 'mylib',
+    'mylib-devel' => 'mylib',
+    'mylib-docs' => 'mylib'
+);
+```
+
+**Used in:** Dependency resolution
+- Dependency on `mylib-devel` means dependency on source package `mylib`
+
+---
+
+### Lines 1075-1080: Store Main Source File
+```perl
+        if (@sorted) {
+            $packs{$name}->{source} = basename($pack->{shift @sorted});
+        }
+
+        if ($base) {
+            $packs{$name}{project_base_path} = $base;
+        }
+```
+
+**Line 1076:** Store primary source tarball name
+- Takes first (lowest numbered) source
+- Only stores basename, not full path
+
+**Lines 1079-1081:** Store git repository path
+- Only set for git-style packages
+- Used for incremental builds
+
+---
+
+### Lines 1085-1114: Append Missing Sub-packages from Repo
+```perl
+    if ($work_done == 1) {
+        my @check_repos = ("$localrepo/$dist/$arch/");
+        my %recal_deps = ();
+        %recal_deps = recalculate_repomddeps(@check_repos);
+
+        foreach my $miss_pack (keys %recal_deps) {
+            if (grep $_ eq $miss_pack, (keys %packs)) {
+                my $pushed = 0;
+                my @packs_subpackages = @{$packs{$miss_pack}->{'subpacks'}};
+                my @recal_rpms = @{$recal_deps{$miss_pack}};
+
+                foreach my $miss_p (@recal_rpms) {
+                  if (!(grep $_ eq $miss_p, (@packs_subpackages))) {
+                    push(@packs_subpackages, $miss_p);
+                    $pushed = 1;
+                  }
+                }
+
+                if ($pushed == 1) {
+                    @{$packs{$miss_pack}->{subpacks}} = @packs_subpackages;
+                    foreach my $sub_p (@{$packs{$miss_pack}->{subpacks}}) {
+                        $tmp_sub_to_main{$sub_p} = $miss_pack;
+                    }
+                    %subptomainp = %tmp_sub_to_main;
+                }
+            }
+        }
+    }
+
+    return %packs;
+}
+```
+
+**Purpose:** Handle packages that generate different sub-packages than spec declares
+
+**When:** Only after first build completes (`$work_done == 1`)
+
+**Problem:** 
+- Spec may conditionally create sub-packages
+- Example: `-devel` package only if certain macros defined
+- Need actual built RPMs to know what was produced
+
+**Solution:**
+- Read actual RPMs from local repo
+- Add any missing sub-packages
+- Update mapping
+
+**Result:** Accurate sub-package list for next iteration
+
+---
+
+## Repository Metadata Parsing
+
+### The refresh_repo() Function
+
+```perl
+sub refresh_repo {
+    my $rpmdeps = "$order_dir/.repo.cache";
+    my (%fn, %prov, %req, %rec);
+    my %exportfilters = %{$config->{'exportfilter'}};
+    my %packs;
+    my %ids;
+
+    my %packs_arch;
+    my %packs_done;
+    open(my $fh, '<', "$rpmdeps") || die("$rpmdeps: $!\n");
+```
+
+**Purpose:** Parse `.repo.cache` and build `%repo` hash
+
+**Variables:**
+- `%fn`: Filename for each package
+- `%prov`: Provides list
+- `%req`: Requires list  
+- `%rec`: Recommends list
+- `%ids`: Package IDs (for version comparison)
+- `%packs`: Final package selection per architecture
+
+---
+
+### Lines 1396-1459: Parse Cache File
+```perl
+    my ($pkgF, $pkgP, $pkgR, $pkgr);
+    while(<$fh>) {
+      chomp;
+      if (/^F:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
+        my $pkgname = basename($2);
+        $pkgF = $2;
+        next if $fn{$1};
+        $fn{$1} = $2;
+        my $pack = $1;
+        $pack =~ /^(.*)\.([^\.]+)$/ or die;
+        push @{$packs_arch{$2}}, $1;
+        my $basename = $1;
+        my $arch = $2;
+        for(keys %exportfilters) {
+            next if ($pkgname !~ /$_/);
+            for (@{$exportfilters{$_}}) {
+                my $target_arch = $_;
+                next if ($target_arch eq ".");
+                next if (! grep ($_ eq $target_arch, @archs));
+                $packs{$basename} = "$basename.$arch"
+            }
+        }
+      } elsif (/^P:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
+        $pkgP = $2;
+        next if $prov{$1};
+        $prov{$1} = $2;
+      } elsif (/^R:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
+        $pkgR = $2;
+        next if $req{$1};
+        $req{$1} = $2;
+      } elsif (/^r:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
+        $pkgr = $2;
+        next if $rec{$1};
+        $rec{$1} = $2;
+      } elsif (/^I:(.*?)-\d+\/\d+\/\d+: (.*)$/) {
+        my $r = 0;
+        if ($use_higher_deps == 1) {
+          $r = 1;
+        } else {
+          if ($packs_done{$1}) {
+            $r = 0;
+          } else {
+            $r = 1;
+          }
+        }
+
+        if ($ids{$1} && ($r == 1) && defined($pkgF) && defined($pkgP) && defined($pkgR)) {
+          my $i = $1;
+          my $oldid = $ids{$1};
+          my $newid = $2;
+          if (Build::Rpm::verscmp($oldid, $newid) < 0) {
+            $ids{$i}  = $newid;
+            $fn{$i}   = $pkgF;
+            $prov{$i} = $pkgP;
+            $req{$i}  = $pkgR;
+          }
+        } else {
+          next if $ids{$1};
+          $ids{$1} = $2;
+        }
+        undef $pkgF;
+        undef $pkgP;
+        undef $pkgR;
+      } elsif ($_ eq 'D:') {
+        %packs_done = %ids;
+      }
+    }
+    close $fh;
+```
+
+**Cache File Format:**
+```
+F:package.arch-123/456/0: /path/package.rpm
+P:package.arch-123/456/0: package = 1.0 provides-this
+R:package.arch-123/456/0: requires-that >= 2.0
+r:package.arch-123/456/0: recommends-another
+I:package.arch-123/456/0: package-1.0-1 123456789
+D:
+```
+
+**Line-by-Line Parsing:**
+
+**F: Filename**
+- Extract package name and architecture
+- Store filename
+- Group packages by architecture
+- Handle export filters (specific arch preferences)
+
+**P: Provides**
+- What this package provides
+- Used in dependency resolution
+
+**R: Requires**
+- What this package requires
+- Hard dependencies
+
+**r: Recommends**
+- Soft dependencies
+- Not mandatory but suggested
+
+**I: Package ID**
+- Version and build time information
+- Handle duplicate packages (keep newer version)
+- `Build::Rpm::verscmp()`: RPM version comparison
+- `$use_higher_deps`: Prefer higher versions across repos
+
+**D: Delimiter**
+- Marks repository boundary
+- After D:, packages can't override earlier ones (unless use_higher_deps)
+
+---
+
+### Lines 1461-1464: Select Architecture-Specific Packages
+```perl
+    for my $arch (@archs) {
+      $packs{$_} ||= "$_.$arch" for @{$packs_arch{$arch} || []};
+    }
+```
+
+**Purpose:** Choose best architecture for each package
+
+**Logic:**
+- Iterate through compatible architectures (x86_64, i686, i586, ...)
+- If package not yet selected, use this architecture's version
+- First match wins (prefer more specific architecture)
